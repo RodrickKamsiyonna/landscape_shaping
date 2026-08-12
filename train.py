@@ -383,6 +383,9 @@ class Trainer:
             vcreg_std_coeff=self.cfg.training.get("vcreg_std_coeff", 0),
             vcreg_cov_coeff=self.cfg.training.get("vcreg_cov_coeff", 0),
             vcreg_apply_to=self.cfg.training.get("vcreg_apply_to", "enc"),
+            landscape_shaping=self.cfg.training.get("landscape_shaping", False), # Or cfg.model.get(...)
+            eqm_lambda=self.cfg.training.get("eqm_lambda", 1.0),
+            eqm_weight=self.cfg.training.get("eqm_weight", 0.5),
         )
         self._log_trainable_params(self.model, "model")
 
