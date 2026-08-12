@@ -100,8 +100,8 @@ class VWorldModel(nn.Module):
         self.concat_dim = concat_dim # 0 or 1
         assert concat_dim == 0 or concat_dim == 1, f"concat_dim {concat_dim} not supported."
         log.info("Model emb_dim: %s", self.emb_dim)
-
-        if "dino" in self.encoder.name:
+        unwrapped_encoder = self.encoder.module if hasattr(self.encoder, "module") else self.encoder
+        if "dino" in unwrapped_encoder:
             decoder_scale = 16  # from vqvae
             num_side_patches = image_size // decoder_scale
             self.encoder_image_size = num_side_patches * encoder.patch_size
