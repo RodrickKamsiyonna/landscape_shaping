@@ -32,6 +32,9 @@ class VWorldModel(nn.Module):
         vcreg_std_coeff=0,
         vcreg_cov_coeff=0,
         vcreg_apply_to="enc",
+        landscape_shaping=False,
+        eqm_lambda=1.0,
+        eqm_weight=0.5,
         **kwargs,
     ):
         super().__init__()
@@ -57,6 +60,12 @@ class VWorldModel(nn.Module):
         self.vcreg = bool(vcreg)
         self.std_coeff = float(vcreg_std_coeff)
         self.cov_coeff = float(vcreg_cov_coeff)
+        
+        # Landscape shaping (EQM) parameters
+        self.landscape_shaping = bool(landscape_shaping)
+        self.eqm_lambda = float(eqm_lambda)
+        self.eqm_weight = float(eqm_weight)
+
         if vcreg_apply_to != "enc":
             raise ValueError(
                 f"Only encoder VCReg is supported, got vcreg_apply_to='{vcreg_apply_to}'."
@@ -89,6 +98,16 @@ class VWorldModel(nn.Module):
             )
         else:
             log.info("Straightening disabled")
+            
+        if self.landscape_shaping:
+            log.info(
+                "Landscape shaping (EQM) enabled: lambda=%s, weight=%s",
+                self.eqm_lambda,
+                self.eqm_weight
+            )
+        else:
+            log.info("Landscape shaping disabled")
+            
         log.info("Stop-grad enabled: %s", self.stop_grad)
         log.info(
             "VCReg enabled: %s, apply_to=enc, std_coeff=%s, cov_coeff=%s",
@@ -352,6 +371,47 @@ class VWorldModel(nn.Module):
             loss_components["z_loss"] = z_loss
             loss_components["z_visual_loss"] = z_visual_loss
             loss_components["z_proprio_loss"] = z_proprio_loss
+            
+            # --- LANDSCAPE SHAPING (EQM) ---
+            if self.landscape_shaping:
+                act_src = act[:, : self.num_hist, ...]
+                batch_size = act_src.shape[0]
+                
+                with torch.enable_grad():
+                    gamma = torch.rand(batch_size, 1, 1, device=act_src.device, dtype=act_src.dtype)
+                    eps = torch.randn_like(act_src)
+                    
+                    act_gamma = (
+                        gamma * act_src.detach() + (1 - gamma) * eps
+                    ).requires_grad_(True)  # (B, num_hist, action_dim)
+                    
+                    # Compute prediction with noisy actions, keeping gradients strictly through actions
+                    z_src_noisy = z_src.detach().clone()
+                    z_src_noisy = self.replace_actions_from_z(z_src_noisy, act_gamma)
+                    z_pred_noisy = self.predict(z_src_noisy)
+                    
+                    # Isolate visual/proprio (non-action) components for target and noisy prediction
+                    if self.concat_dim == 0:
+                        pred_noisy_vp = z_pred_noisy[:, :, :-1, :]
+                        tgt_vp = z_tgt.detach()[:, :, :-1, :]
+                    elif self.concat_dim == 1:
+                        pred_noisy_vp = z_pred_noisy[..., :-self.action_dim]
+                        tgt_vp = z_tgt.detach()[..., :-self.action_dim]
+                        
+                    # Calculate energy as sum of squared distances over all dimensions (creates scalar)
+                    energy = (pred_noisy_vp - tgt_vp).pow(2).sum()
+                    
+                    # Gradients of energy w.r.t the noisy actions
+                    grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
+                    
+                    # Target gradient
+                    target_grad = (eps - act_src.detach()) * self.eqm_lambda * (1 - gamma)
+                    
+                pred_loss_eqm = (grad_energy - target_grad).pow(2).mean()
+                loss = loss + self.eqm_weight * pred_loss_eqm
+                
+                loss_components["pred_loss_eqm"] = pred_loss_eqm
+                loss_components["energy"] = energy.detach()
 
             if self.vcreg:
                 z_vic_in = self.visual_prop(z)
