@@ -359,17 +359,12 @@ class Trainer:
                         log.info(f"Passing projector_cfg to decoder")
                     decoder_kwargs["_recursive_"] = False
                     self.decoder = hydra.utils.instantiate(self.cfg.decoder, **decoder_kwargs)
-        if not self.train_decoder:
-            for param in self.decoder.parameters():
-                param.requires_grad = False
-                
+            if not self.train_decoder:
+                for param in self.decoder.parameters():
+                    param.requires_grad = False
         self.encoder, self.predictor, self.decoder = self.accelerator.prepare(
             self.encoder, self.predictor, self.decoder
         )
-
-        self.encoder.emb_dim = self.accelerator.unwrap_model(self.encoder).emb_dim
-        # ----------------------------------------------------
-
         self.model = hydra.utils.instantiate(
             self.cfg.model,
             encoder=self.encoder,
