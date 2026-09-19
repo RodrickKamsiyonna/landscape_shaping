@@ -386,10 +386,9 @@ class VWorldModel(nn.Module):
                     ).requires_grad_(True)  # (B, num_hist, action_dim)
                     
                     # Compute prediction with noisy actions, keeping gradients strictly through actions
-                    z_src_noisy = z_src.detach().clone()
-                    z_src_noisy = self.replace_actions_from_z(z_src_noisy, act_gamma)
+                    z_src_noisy = self.replace_actions_from_z(z_src,act_gamma,)
                     z_pred_noisy = self.predict(z_src_noisy)
-                    
+
                     # Isolate visual/proprio (non-action) components for target and noisy prediction
                     if self.concat_dim == 0:
                         pred_noisy_vp = z_pred_noisy[:, :, :-1, :]
@@ -399,7 +398,7 @@ class VWorldModel(nn.Module):
                         tgt_vp = z_tgt.detach()[..., :-self.action_dim]
                         
                     # Calculate energy as sum of squared distances over all dimensions (creates scalar)
-                    energy = (pred_noisy_vp - tgt_vp).pow(2).sum()
+                    energy = (pred_noisy_vp - tgt_vp).pow(2).mean(dim=-1).sum()
                     
                     # Gradients of energy w.r.t the noisy actions
                     grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
@@ -458,14 +457,34 @@ class VWorldModel(nn.Module):
 
     def replace_actions_from_z(self, z, act):
         act_emb = self.encode_act(act)
+    
         if self.concat_dim == 0:
-            z[:, :, -1, :] = act_emb
+            return torch.cat(
+                [
+                    z[:, :, :-1, :],
+                    act_emb.unsqueeze(2),
+                ],
+                dim=2,
+            )
+    
         elif self.concat_dim == 1:
-            act_tiled = repeat(act_emb.unsqueeze(2), "b t 1 a -> b t f a", f=z.shape[2])
-            act_repeated = act_tiled.repeat(1, 1, 1, self.num_action_repeat)
-            z[..., -self.action_dim:] = act_repeated
-        return z
-
+            act_tiled = repeat(
+                act_emb.unsqueeze(2),
+                "b t 1 a -> b t f a",
+                f=z.shape[2],
+            )
+    
+            act_repeated = act_tiled.repeat(
+                1, 1, 1, self.num_action_repeat
+            )
+    
+            return torch.cat(
+                [
+                    z[..., :-self.action_dim],
+                    act_repeated,
+                ],
+                dim=-1,
+        )
 
     def rollout(self, obs_0, act):
         """
