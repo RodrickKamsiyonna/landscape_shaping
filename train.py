@@ -12,6 +12,7 @@ from tqdm import tqdm
 from omegaconf import OmegaConf, open_dict
 from einops import rearrange
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from torchvision import utils
 import torch.distributed as dist
 from pathlib import Path
@@ -63,9 +64,17 @@ class Trainer:
             # # ==== /init ddp process group ====
 
         mixed_precision = self.cfg.training.get("mixed_precision", "no")
+        # A decoder that is inactive for the first epochs leaves its params unused in
+        # forward, which DDP rejects unless find_unused_parameters=True. Only pay that
+        # cost when a decoder actually exists.
         self.accelerator = Accelerator(
             log_with="wandb",
             mixed_precision=mixed_precision,
+            kwargs_handlers=[
+                DistributedDataParallelKwargs(
+                    find_unused_parameters=bool(self.cfg.get("has_decoder", False))
+                )
+            ],
         )
         log.info(f"Accelerate mixed precision: {mixed_precision}")
         log.info(
@@ -324,7 +333,6 @@ class Trainer:
             )
         proprio_emb_dim = self.proprio_encoder.emb_dim
         print(f"Proprio encoder type: {type(self.proprio_encoder)}")
-        self.proprio_encoder = self.accelerator.prepare(self.proprio_encoder)
 
         if self.action_encoder is None:
             self.action_encoder = hydra.utils.instantiate(
@@ -334,8 +342,6 @@ class Trainer:
             )
         action_emb_dim = self.action_encoder.emb_dim
         print(f"Action encoder type: {type(self.action_encoder)}")
-
-        self.action_encoder = self.accelerator.prepare(self.action_encoder)
 
         if self.accelerator.is_main_process:
             self.wandb_run.watch(self.action_encoder)
@@ -398,9 +404,11 @@ class Trainer:
             if not self.train_decoder:
                 for param in self.decoder.parameters():
                     param.requires_grad = False
-        self.encoder, self.predictor, self.decoder = self.accelerator.prepare(
-            self.encoder, self.predictor, self.decoder
-        )
+        # NOTE: submodules are intentionally NOT passed to accelerator.prepare() one by
+        # one. Doing so wraps each trainable module in its own DDP, which (a) hides
+        # attributes like `encoder.emb_dim` from VWorldModel and (b) breaks when a
+        # module is called twice per step (EQM double backward). Instead the whole
+        # VWorldModel is wrapped once below.
         self.model = hydra.utils.instantiate(
             self.cfg.model,
             encoder=self.encoder,
@@ -424,6 +432,13 @@ class Trainer:
             eqm_weight=self.cfg.training.get("eqm_weight", 0.5),
         )
         self._log_trainable_params(self.model, "model")
+
+        # Single DDP wrapper around the whole model (one forward + one backward per
+        # step). prepare() also moves the model to the right device in place, so
+        # self.model (raw) shares parameters with self.ddp_model. Use self.ddp_model
+        # only for the training forward pass; use self.model for everything else
+        # (attributes, rollout, eval). On a single process, ddp_model is model.
+        self.ddp_model = self.accelerator.prepare(self.model)
 
     def init_optimizers(self):
         self.encoder_optimizer = torch.optim.Adam(
@@ -602,7 +617,7 @@ class Trainer:
             self.model.train()
             if self.cfg.has_decoder:
                 self.decoder.train(decoder_active)
-            z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
+            z_out, visual_out, visual_reconstructed, loss, loss_components = self.ddp_model(
                 obs, act
             )
 
