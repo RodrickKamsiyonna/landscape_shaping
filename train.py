@@ -27,6 +27,10 @@ import custom_resolvers  # noqa: F401  # Registers OmegaConf resolvers at import
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
 
+# Save a rolling "latest" checkpoint every N training iterations (mid-epoch).
+SAVE_EVERY_ITERS = 500
+
+
 class Trainer:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -74,6 +78,8 @@ class Trainer:
         self.num_reconstruct_samples = self.cfg.training.num_reconstruct_samples
         self.total_epochs = self.cfg.training.epochs
         self.epoch = 0
+        self.save_every_iters = SAVE_EVERY_ITERS
+        log.info(f"Mid-epoch checkpoint every {self.save_every_iters} iterations")
         self.decoder_start_epoch = int(self.cfg.training.get("decoder_start_epoch", 1))
         if self.decoder_start_epoch < 1:
             log.warning(
@@ -139,7 +145,7 @@ class Trainer:
             x: torch.utils.data.DataLoader(
                 self.datasets[x],
                 batch_size=self.cfg.gpu_batch_size,
-                shuffle=False, # already shuffled in TrajSlicerDataset
+                shuffle=False,  # already shuffled in TrajSlicerDataset
                 num_workers=self.cfg.env.num_workers,
                 collate_fn=None,
                 pin_memory=True,
@@ -174,7 +180,7 @@ class Trainer:
             ["encoder", "encoder_optimizer"] if self.train_encoder else []
         )
         self._keys_to_save += (
-            ["predictor", "predictor_optimizer"]
+            ["predictor", "predictor_optimizer", "action_encoder_optimizer"]
             if self.train_predictor and self.cfg.has_predictor
             else []
         )
@@ -194,6 +200,8 @@ class Trainer:
             for param in base_model.parameters():
                 param.requires_grad = False
             log.info("Encoder base_model is frozen.")
+        else:
+            log.info("Encoder has no base_model; nothing to freeze.")
 
         if not self.train_encoder:
             for param in self.encoder.parameters():
@@ -201,11 +209,14 @@ class Trainer:
             log.info("Encoder is fully frozen (train_encoder=False).")
             return
 
-        # train_encoder=True: keep non-backbone encoder modules trainable.
-        for name, param in self.encoder.named_parameters():
-            if not name.startswith("base_model."):
-                param.requires_grad = True
-        log.info("Encoder base_model frozen; non-backbone encoder modules are trainable.")
+        if base_model is not None:
+            # train_encoder=True: keep non-backbone encoder modules trainable.
+            for name, param in self.encoder.named_parameters():
+                if not name.startswith("base_model."):
+                    param.requires_grad = True
+            log.info("Encoder base_model frozen; non-backbone modules are trainable.")
+        else:
+            log.info("Encoder fully trainable.")
 
     def _log_trainable_params(self, module, module_name):
         if not self.accelerator.is_main_process:
@@ -224,11 +235,17 @@ class Trainer:
             and self.epoch >= self.decoder_start_epoch
         )
 
-    def save_ckpt(self):
+    def save_ckpt(self, mid_epoch=False):
+        """
+        mid_epoch=False: end-of-epoch save. Writes model_latest.pth and model_{epoch}.pth.
+        mid_epoch=True:  rolling save inside an epoch. Only overwrites model_latest.pth,
+                         and records the last *completed* epoch (epoch - 1) so that a resume
+                         re-runs the interrupted epoch instead of skipping it.
+        """
         self.accelerator.wait_for_everyone()
+        ckpt_path = None
         if self.accelerator.is_main_process:
-            if not os.path.exists("checkpoints"):
-                os.makedirs("checkpoints")
+            os.makedirs("checkpoints", exist_ok=True)
             ckpt = {}
             for k in self._keys_to_save:
                 v = self.__dict__.get(k, None)
@@ -238,18 +255,33 @@ class Trainer:
                     ckpt[k] = self.accelerator.unwrap_model(v)
                 else:
                     ckpt[k] = v
-            torch.save(ckpt, "checkpoints/model_latest.pth")
-            torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
-            log.info("Saved model to {}".format(os.getcwd()))
-            ckpt_path = os.path.join(os.getcwd(), f"checkpoints/model_{self.epoch}.pth")
-        else:
-            ckpt_path = None
+            ckpt["epoch"] = self.epoch - 1 if mid_epoch else self.epoch
+
+            # Write to a temp file, then atomically replace, so a session kill
+            # mid-write can't leave a corrupt model_latest.pth.
+            tmp_path = "checkpoints/model_latest.pth.tmp"
+            torch.save(ckpt, tmp_path)
+            os.replace(tmp_path, "checkpoints/model_latest.pth")
+
+            if mid_epoch:
+                log.info(
+                    f"Saved mid-epoch checkpoint (epoch {self.epoch}) to {os.getcwd()}"
+                )
+            else:
+                torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
+                log.info("Saved model to {}".format(os.getcwd()))
+                ckpt_path = os.path.join(
+                    os.getcwd(), f"checkpoints/model_{self.epoch}.pth"
+                )
         model_name = self.cfg["saved_folder"].split("/")[-1]
         model_epoch = self.epoch
         return ckpt_path, model_name, model_epoch
 
     def load_ckpt(self, filename="model_latest.pth"):
-        ckpt = torch.load(filename)
+        # weights_only=False: checkpoints contain pickled nn.Module objects
+        # (PyTorch >= 2.6 defaults to weights_only=True, which rejects them).
+        # Only load checkpoints you created yourself.
+        ckpt = torch.load(filename, map_location="cpu", weights_only=False)
         self._loaded_optim_state = {}
         for k, v in ckpt.items():
             if k.endswith("_optimizer") and isinstance(v, dict):
@@ -282,20 +314,24 @@ class Trainer:
             )
         self._configure_encoder_trainability()
 
-        self.proprio_encoder = hydra.utils.instantiate(
-            self.cfg.proprio_encoder,
-            in_chans=self.datasets["train"].proprio_dim,
-            emb_dim=self.cfg.proprio_emb_dim,
-        )
+        # Only build fresh proprio/action encoders if they weren't restored from a
+        # checkpoint; otherwise resuming would silently discard their trained weights.
+        if self.proprio_encoder is None:
+            self.proprio_encoder = hydra.utils.instantiate(
+                self.cfg.proprio_encoder,
+                in_chans=self.datasets["train"].proprio_dim,
+                emb_dim=self.cfg.proprio_emb_dim,
+            )
         proprio_emb_dim = self.proprio_encoder.emb_dim
         print(f"Proprio encoder type: {type(self.proprio_encoder)}")
         self.proprio_encoder = self.accelerator.prepare(self.proprio_encoder)
 
-        self.action_encoder = hydra.utils.instantiate(
-            self.cfg.action_encoder,
-            in_chans=self.datasets["train"].action_dim,
-            emb_dim=self.cfg.action_emb_dim,
-        )
+        if self.action_encoder is None:
+            self.action_encoder = hydra.utils.instantiate(
+                self.cfg.action_encoder,
+                in_chans=self.datasets["train"].action_dim,
+                emb_dim=self.cfg.action_emb_dim,
+            )
         action_emb_dim = self.action_encoder.emb_dim
         print(f"Action encoder type: {type(self.action_encoder)}")
 
@@ -340,15 +376,15 @@ class Trainer:
                     decoder_path = os.path.join(
                         self.base_path, self.cfg.env.decoder_path
                     )
-                    ckpt = torch.load(decoder_path)
+                    ckpt = torch.load(decoder_path, weights_only=False)
                     if isinstance(ckpt, dict):
                         self.decoder = ckpt["decoder"]
                     else:
-                        self.decoder = torch.load(decoder_path)
+                        self.decoder = torch.load(decoder_path, weights_only=False)
                     log.info(f"Loaded decoder from {decoder_path}")
                 else:
                     decoder_kwargs = {
-                        "emb_dim": self.encoder.emb_dim,  
+                        "emb_dim": self.encoder.emb_dim,
                     }
                     if (
                         hasattr(self.cfg.encoder, "projector_config")
@@ -383,7 +419,7 @@ class Trainer:
             vcreg_std_coeff=self.cfg.training.get("vcreg_std_coeff", 0),
             vcreg_cov_coeff=self.cfg.training.get("vcreg_cov_coeff", 0),
             vcreg_apply_to=self.cfg.training.get("vcreg_apply_to", "enc"),
-            landscape_shaping=self.cfg.training.get("landscape_shaping", False), # Or cfg.model.get(...)
+            landscape_shaping=self.cfg.training.get("landscape_shaping", False),  # Or cfg.model.get(...)
             eqm_lambda=self.cfg.training.get("eqm_lambda", 1.0),
             eqm_weight=self.cfg.training.get("eqm_weight", 0.5),
         )
@@ -654,12 +690,15 @@ class Trainer:
             loss_components = {f"train_{k}": [v] for k, v in loss_components.items()}
             self.logs_update(loss_components)
 
+            # Rolling mid-epoch checkpoint every `save_every_iters` iterations.
+            # `i > 0` avoids saving a useless one-step checkpoint at iteration 0.
             if (
-                self.cfg.training.save_every_x_iterations > 0
-                and i % self.cfg.training.save_every_x_iterations == 0
+                self.save_every_iters > 0
+                and i > 0
+                and i % self.save_every_iters == 0
             ):
                 self.logs_flash_iter(iteration=i)
-                self.save_ckpt()
+                self.save_ckpt(mid_epoch=True)
 
     @torch.no_grad()
     def val(self):
@@ -798,8 +837,8 @@ class Trainer:
 
             for k in obs.keys():
                 obs[k] = obs[k][
-                    start : 
-                    start + horizon * self.cfg.frameskip + 1 : 
+                    start :
+                    start + horizon * self.cfg.frameskip + 1 :
                     self.cfg.frameskip
                 ]
             act = act[start : start + horizon * self.cfg.frameskip]
