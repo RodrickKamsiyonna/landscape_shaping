@@ -398,7 +398,7 @@ class VWorldModel(nn.Module):
                         tgt_vp = z_tgt.detach()[..., :-self.action_dim]
                         
                     # Calculate energy as sum of squared distances over all dimensions (creates scalar)
-                    energy = (pred_noisy_vp - tgt_vp).pow(2).mean(dim=-1).sum()
+                    energy = (pred_noisy_vp - tgt_vp).pow(2).sum()
                     
                     # Gradients of energy w.r.t the noisy actions
                     grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
