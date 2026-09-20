@@ -21,221 +21,230 @@ from hydra.types import RunMode
 from hydra.core.hydra_config import HydraConfig
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
+
 from metrics.image_metrics import eval_images
 from utils import slice_trajdict_with_t, cfg_to_dict, seed, sample_tensors
-import custom_resolvers  # noqa: F401  # Registers OmegaConf resolvers at import time.
+import custom_resolvers  # noqa: F401
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
 
-# Save a rolling "latest" checkpoint every N training iterations (mid-epoch).
 SAVE_EVERY_ITERS = 500
 
 
 class Trainer:
     def __init__(self, cfg):
         self.cfg = cfg
+
         with open_dict(cfg):
             cfg["saved_folder"] = os.getcwd()
-            log.info(f"Model saved dir: {cfg['saved_folder']}")
+
         cfg_dict = cfg_to_dict(cfg)
         model_name = cfg_dict["saved_folder"].split("checkpoints/")[-1]
-        model_name += f"_f{self.cfg.frameskip}_h{self.cfg.num_hist}_p{self.cfg.num_pred}"
+        model_name += f"_f{cfg.frameskip}_h{cfg.num_hist}_p{cfg.num_pred}"
 
         if HydraConfig.get().mode == RunMode.MULTIRUN:
-            log.info(" Multirun setup begin...")
-            log.info(f"SLURM_JOB_NODELIST={os.environ['SLURM_JOB_NODELIST']}")
-            log.info(f"DEBUGVAR={os.environ['DEBUGVAR']}")
-            # ==== init ddp process group ====
             os.environ["RANK"] = os.environ["SLURM_PROCID"]
             os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
             os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
-            try:
-                dist.init_process_group(
-                    backend="nccl",
-                    init_method="env://",
-                    timeout=timedelta(minutes=5),  # Set a 5-minute timeout
-                )
-                log.info("Multirun setup completed.")
-            except Exception as e:
-                log.error(f"DDP setup failed: {e}")
-                raise
-            torch.distributed.barrier()
-            # # ==== /init ddp process group ====
 
-        mixed_precision = self.cfg.training.get("mixed_precision", "no")
-        # A decoder that is inactive for the first epochs leaves its params unused in
-        # forward, which DDP rejects unless find_unused_parameters=True. Only pay that
-        # cost when a decoder actually exists.
+            dist.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                timeout=timedelta(minutes=5),
+            )
+            dist.barrier()
+
+        mixed_precision = cfg.training.get("mixed_precision", "no")
+
         self.accelerator = Accelerator(
             log_with="wandb",
             mixed_precision=mixed_precision,
             kwargs_handlers=[
                 DistributedDataParallelKwargs(
-                    find_unused_parameters=bool(self.cfg.get("has_decoder", False))
+                    find_unused_parameters=bool(cfg.get("has_decoder", False))
                 )
             ],
         )
+
+        self.device = self.accelerator.device
+        self.base_path = os.path.dirname(os.path.abspath(__file__))
+        self.num_reconstruct_samples = cfg.training.num_reconstruct_samples
+        self.total_epochs = cfg.training.epochs
+        self.epoch = 0
+        self.global_step = 0
+        self.save_every_iters = SAVE_EVERY_ITERS
+
         log.info(f"Accelerate mixed precision: {mixed_precision}")
         log.info(
-            f"rank: {self.accelerator.local_process_index}  model_name: {model_name}"
+            f"rank={self.accelerator.local_process_index} device={self.device}"
         )
-        self.device = self.accelerator.device
-        log.info(f"device: {self.device}   model_name: {model_name}")
-        self.base_path = os.path.dirname(os.path.abspath(__file__))
-
-        self.num_reconstruct_samples = self.cfg.training.num_reconstruct_samples
-        self.total_epochs = self.cfg.training.epochs
-        self.epoch = 0
-        self.save_every_iters = SAVE_EVERY_ITERS
         log.info(f"Mid-epoch checkpoint every {self.save_every_iters} iterations")
-        self.decoder_start_epoch = int(self.cfg.training.get("decoder_start_epoch", 1))
-        if self.decoder_start_epoch < 1:
-            log.warning(
-                f"decoder_start_epoch={self.decoder_start_epoch} is invalid; clamping to 1"
-            )
-            self.decoder_start_epoch = 1
-        log.info(f"Decoder training will start at epoch {self.decoder_start_epoch}")
+
+        self.decoder_start_epoch = int(
+            cfg.training.get("decoder_start_epoch", 1)
+        )
+        self.decoder_start_epoch = max(1, self.decoder_start_epoch)
 
         assert cfg.training.batch_size % self.accelerator.num_processes == 0, (
-            "Batch size must be divisible by the number of processes. "
-            f"Batch_size: {cfg.training.batch_size} num_processes: {self.accelerator.num_processes}."
+            "Batch size must be divisible by number of processes. "
+            f"batch_size={cfg.training.batch_size}, "
+            f"num_processes={self.accelerator.num_processes}"
         )
 
         OmegaConf.set_struct(cfg, False)
         cfg.effective_batch_size = cfg.training.batch_size
-        cfg.gpu_batch_size = cfg.training.batch_size // self.accelerator.num_processes
+        cfg.gpu_batch_size = (
+            cfg.training.batch_size // self.accelerator.num_processes
+        )
         OmegaConf.set_struct(cfg, True)
 
         self.accelerator.wait_for_everyone()
+
         if self.accelerator.is_main_process:
             wandb_run_id = None
+
             if os.path.exists("hydra.yaml"):
                 existing_cfg = OmegaConf.load("hydra.yaml")
-                wandb_run_id = existing_cfg["wandb_run_id"]
-                log.info(f"Resuming Wandb run {wandb_run_id}")
+                wandb_run_id = existing_cfg.get("wandb_run_id")
+                log.info(f"Resuming WandB run {wandb_run_id}")
 
             wandb_dict = OmegaConf.to_container(cfg, resolve=True)
-            if self.cfg.debug:
-                log.info("WARNING: Running in debug mode...")
-                self.wandb_run = wandb.init(
-                    project=f"temporal_straightening_{self.cfg.env.name}",
-                    config=wandb_dict,
-                    id=wandb_run_id,
-                    resume="allow",
-                )
-            else:
-                self.wandb_run = wandb.init(
-                    project=f"temporal_straightening_{self.cfg.env.name}",
-                    config=wandb_dict,
-                    id=wandb_run_id,
-                    resume="allow",
-                )
+
+            self.wandb_run = wandb.init(
+                project=f"temporal_straightening_{cfg.env.name}",
+                config=wandb_dict,
+                id=wandb_run_id,
+                resume="allow",
+            )
+
             OmegaConf.set_struct(cfg, False)
             cfg.wandb_run_id = self.wandb_run.id
             OmegaConf.set_struct(cfg, True)
-            wandb.run.name = "{}".format(model_name)
+
+            self.wandb_run.name = model_name
+
             with open(os.path.join(os.getcwd(), "hydra.yaml"), "w") as f:
                 f.write(OmegaConf.to_yaml(cfg, resolve=True))
 
         seed(cfg.training.seed)
-        log.info(f"Loading dataset from {self.cfg.env.dataset.data_path} ...")
+
+        log.info(f"Loading dataset from {cfg.env.dataset.data_path} ...")
+
         self.datasets, traj_dsets = hydra.utils.call(
-            self.cfg.env.dataset,
-            num_hist=self.cfg.num_hist,
-            num_pred=self.cfg.num_pred,
-            frameskip=self.cfg.frameskip,
+            cfg.env.dataset,
+            num_hist=cfg.num_hist,
+            num_pred=cfg.num_pred,
+            frameskip=cfg.frameskip,
         )
 
         self.train_traj_dset = traj_dsets["train"]
         self.val_traj_dset = traj_dsets["valid"]
 
         self.dataloaders = {
-            x: torch.utils.data.DataLoader(
-                self.datasets[x],
-                batch_size=self.cfg.gpu_batch_size,
-                shuffle=False,  # already shuffled in TrajSlicerDataset
-                num_workers=self.cfg.env.num_workers,
+            split: torch.utils.data.DataLoader(
+                self.datasets[split],
+                batch_size=cfg.gpu_batch_size,
+                shuffle=False,
+                num_workers=cfg.env.num_workers,
                 collate_fn=None,
                 pin_memory=True,
-                persistent_workers=True,
+                persistent_workers=cfg.env.num_workers > 0,
             )
-            for x in ["train", "valid"]
+            for split in ["train", "valid"]
         }
 
-        log.info(f"dataloader batch size: {self.cfg.gpu_batch_size}")
-
-        self.dataloaders["train"], self.dataloaders["valid"] = self.accelerator.prepare(
-            self.dataloaders["train"], self.dataloaders["valid"]
+        self.dataloaders["train"], self.dataloaders["valid"] = (
+            self.accelerator.prepare(
+                self.dataloaders["train"],
+                self.dataloaders["valid"],
+            )
         )
+
+        log.info(f"Dataloader batch size per GPU: {cfg.gpu_batch_size}")
 
         self.encoder = None
         self.action_encoder = None
         self.proprio_encoder = None
         self.predictor = None
         self.decoder = None
-        self.train_encoder = self.cfg.model.train_encoder
-        self.train_predictor = self.cfg.model.train_predictor
-        self.train_decoder = self.cfg.model.train_decoder
-        log.info(f"Train encoder, predictor, decoder:\
-            {self.cfg.model.train_encoder}\
-            {self.cfg.model.train_predictor}\
-            {self.cfg.model.train_decoder}")
+
+        self.train_encoder = cfg.model.train_encoder
+        self.train_predictor = cfg.model.train_predictor
+        self.train_decoder = cfg.model.train_decoder
 
         self._keys_to_save = [
             "epoch",
+            "global_step",
         ]
-        self._keys_to_save += (
-            ["encoder", "encoder_optimizer"] if self.train_encoder else []
-        )
-        self._keys_to_save += (
-            ["predictor", "predictor_optimizer", "action_encoder_optimizer"]
-            if self.train_predictor and self.cfg.has_predictor
-            else []
-        )
-        self._keys_to_save += (
-            ["decoder", "decoder_optimizer"] if self.train_decoder else []
-        )
-        self._keys_to_save += ["action_encoder", "proprio_encoder"]
+
+        if self.train_encoder:
+            self._keys_to_save += ["encoder", "encoder_optimizer"]
+
+        if self.train_predictor and cfg.has_predictor:
+            self._keys_to_save += [
+                "predictor",
+                "predictor_optimizer",
+                "action_encoder_optimizer",
+            ]
+
+        if self.train_decoder:
+            self._keys_to_save += ["decoder", "decoder_optimizer"]
+
+        self._keys_to_save += [
+            "action_encoder",
+            "proprio_encoder",
+        ]
 
         self.init_models()
         self.init_optimizers()
 
+        # Backward compatibility for older checkpoints without global_step.
+        if self.global_step == 0 and self.epoch > 0:
+            self.global_step = (
+                self.epoch * len(self.dataloaders["train"])
+            )
+
         self.epoch_log = OrderedDict()
+
+    # ------------------------------------------------------------------
+    # Model setup
+    # ------------------------------------------------------------------
 
     def _configure_encoder_trainability(self):
         base_model = getattr(self.encoder, "base_model", None)
+
         if base_model is not None:
-            for param in base_model.parameters():
-                param.requires_grad = False
-            log.info("Encoder base_model is frozen.")
+            for p in base_model.parameters():
+                p.requires_grad = False
+            log.info("Encoder base_model frozen.")
         else:
             log.info("Encoder has no base_model; nothing to freeze.")
 
         if not self.train_encoder:
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-            log.info("Encoder is fully frozen (train_encoder=False).")
+            for p in self.encoder.parameters():
+                p.requires_grad = False
+            log.info("Encoder fully frozen.")
             return
 
         if base_model is not None:
-            # train_encoder=True: keep non-backbone encoder modules trainable.
-            for name, param in self.encoder.named_parameters():
+            for name, p in self.encoder.named_parameters():
                 if not name.startswith("base_model."):
-                    param.requires_grad = True
-            log.info("Encoder base_model frozen; non-backbone modules are trainable.")
+                    p.requires_grad = True
+            log.info("Encoder backbone frozen; extra modules trainable.")
         else:
             log.info("Encoder fully trainable.")
 
-    def _log_trainable_params(self, module, module_name):
+    def _log_trainable_params(self, module, name):
         if not self.accelerator.is_main_process:
             return
+
         total = sum(p.numel() for p in module.parameters())
-        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
-        log.info(f"[{module_name}] trainable params: {trainable} / {total}")
-        for name, param in module.named_parameters():
-            if param.requires_grad:
-                log.info(f"[{module_name}] trainable: {name} shape={tuple(param.shape)}")
+        trainable = sum(
+            p.numel() for p in module.parameters() if p.requires_grad
+        )
+
+        log.info(f"[{name}] trainable params: {trainable}/{total}")
 
     def decoder_training_active(self):
         return (
@@ -244,72 +253,23 @@ class Trainer:
             and self.epoch >= self.decoder_start_epoch
         )
 
-    def save_ckpt(self, mid_epoch=False):
-        """
-        mid_epoch=False: end-of-epoch save. Writes model_latest.pth and model_{epoch}.pth.
-        mid_epoch=True:  rolling save inside an epoch. Only overwrites model_latest.pth,
-                         and records the last *completed* epoch (epoch - 1) so that a resume
-                         re-runs the interrupted epoch instead of skipping it.
-        """
-        self.accelerator.wait_for_everyone()
-        ckpt_path = None
-        if self.accelerator.is_main_process:
-            os.makedirs("checkpoints", exist_ok=True)
-            ckpt = {}
-            for k in self._keys_to_save:
-                v = self.__dict__.get(k, None)
-                if k.endswith("_optimizer") and v is not None:
-                    ckpt[k] = v.state_dict()
-                elif hasattr(v, "module"):
-                    ckpt[k] = self.accelerator.unwrap_model(v)
-                else:
-                    ckpt[k] = v
-            ckpt["epoch"] = self.epoch - 1 if mid_epoch else self.epoch
-
-            # Write to a temp file, then atomically replace, so a session kill
-            # mid-write can't leave a corrupt model_latest.pth.
-            tmp_path = "checkpoints/model_latest.pth.tmp"
-            torch.save(ckpt, tmp_path)
-            os.replace(tmp_path, "checkpoints/model_latest.pth")
-
-            if mid_epoch:
-                log.info(
-                    f"Saved mid-epoch checkpoint (epoch {self.epoch}) to {os.getcwd()}"
-                )
-            else:
-                torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
-                log.info("Saved model to {}".format(os.getcwd()))
-                ckpt_path = os.path.join(
-                    os.getcwd(), f"checkpoints/model_{self.epoch}.pth"
-                )
-        model_name = self.cfg["saved_folder"].split("/")[-1]
-        model_epoch = self.epoch
-        return ckpt_path, model_name, model_epoch
-
-    def load_ckpt(self, filename="model_latest.pth"):
-        # weights_only=False: checkpoints contain pickled nn.Module objects
-        # (PyTorch >= 2.6 defaults to weights_only=True, which rejects them).
-        # Only load checkpoints you created yourself.
-        ckpt = torch.load(filename, map_location="cpu", weights_only=False)
-        self._loaded_optim_state = {}
-        for k, v in ckpt.items():
-            if k.endswith("_optimizer") and isinstance(v, dict):
-                self._loaded_optim_state[k] = v
-            else:
-                self.__dict__[k] = v
-        not_in_ckpt = set(self._keys_to_save) - set(ckpt.keys())
-        if len(not_in_ckpt):
-            log.warning("Keys not found in ckpt: %s", not_in_ckpt)
-
     def init_models(self):
-        model_ckpt = Path(self.cfg.saved_folder) / "checkpoints" / "model_latest.pth"
+        model_ckpt = (
+            Path(self.cfg.saved_folder)
+            / "checkpoints"
+            / "model_latest.pth"
+        )
+
         if model_ckpt.exists():
             self.load_ckpt(model_ckpt)
-            log.info(f"Resuming from epoch {self.epoch}: {model_ckpt}")
+            log.info(
+                f"Resuming from epoch={self.epoch}, "
+                f"global_step={self.global_step}"
+            )
 
-        # initialize encoder
         if self.encoder is None:
             encoder_kwargs = {}
+
             if (
                 hasattr(self.cfg.encoder, "projector_config")
                 and self.cfg.encoder.projector_config is not None
@@ -317,22 +277,20 @@ class Trainer:
                 encoder_kwargs["projector_config"] = hydra.utils.instantiate(
                     self.cfg.encoder.projector_config
                 )
+
             self.encoder = hydra.utils.instantiate(
                 self.cfg.encoder,
                 **encoder_kwargs,
             )
+
         self._configure_encoder_trainability()
 
-        # Only build fresh proprio/action encoders if they weren't restored from a
-        # checkpoint; otherwise resuming would silently discard their trained weights.
         if self.proprio_encoder is None:
             self.proprio_encoder = hydra.utils.instantiate(
                 self.cfg.proprio_encoder,
                 in_chans=self.datasets["train"].proprio_dim,
                 emb_dim=self.cfg.proprio_emb_dim,
             )
-        proprio_emb_dim = self.proprio_encoder.emb_dim
-        print(f"Proprio encoder type: {type(self.proprio_encoder)}")
 
         if self.action_encoder is None:
             self.action_encoder = hydra.utils.instantiate(
@@ -340,20 +298,20 @@ class Trainer:
                 in_chans=self.datasets["train"].action_dim,
                 emb_dim=self.cfg.action_emb_dim,
             )
+
+        proprio_emb_dim = self.proprio_encoder.emb_dim
         action_emb_dim = self.action_encoder.emb_dim
-        print(f"Action encoder type: {type(self.action_encoder)}")
 
         if self.accelerator.is_main_process:
             self.wandb_run.watch(self.action_encoder)
             self.wandb_run.watch(self.proprio_encoder)
 
-        # initialize predictor
-        if self.encoder.latent_ndim == 1:  # if feature is 1D
+        if self.encoder.latent_ndim == 1:
             num_patches = 1
         else:
-            decoder_scale = 16  # from vqvae
+            decoder_scale = 16
             num_side_patches = self.cfg.img_size // decoder_scale
-            num_patches = num_side_patches**2
+            num_patches = num_side_patches ** 2
 
         if self.cfg.concat_dim == 0:
             num_patches += 2
@@ -364,51 +322,59 @@ class Trainer:
                     self.cfg.predictor,
                     num_patches=num_patches,
                     num_frames=self.cfg.num_hist,
-                    dim=self.encoder.emb_dim
-                    + (
-                        proprio_emb_dim * self.cfg.num_proprio_repeat
-                        + action_emb_dim * self.cfg.num_action_repeat
-                    )
-                    * (self.cfg.concat_dim),
+                    dim=(
+                        self.encoder.emb_dim
+                        + (
+                            proprio_emb_dim * self.cfg.num_proprio_repeat
+                            + action_emb_dim * self.cfg.num_action_repeat
+                        )
+                        * self.cfg.concat_dim
+                    ),
                 )
-            if not self.train_predictor:
-                for param in self.predictor.parameters():
-                    param.requires_grad = False
 
-        # initialize decoder
+            if not self.train_predictor:
+                for p in self.predictor.parameters():
+                    p.requires_grad = False
+
         if self.cfg.has_decoder:
             if self.decoder is None:
                 if self.cfg.env.decoder_path is not None:
                     decoder_path = os.path.join(
-                        self.base_path, self.cfg.env.decoder_path
+                        self.base_path,
+                        self.cfg.env.decoder_path,
                     )
-                    ckpt = torch.load(decoder_path, weights_only=False)
-                    if isinstance(ckpt, dict):
-                        self.decoder = ckpt["decoder"]
-                    else:
-                        self.decoder = torch.load(decoder_path, weights_only=False)
-                    log.info(f"Loaded decoder from {decoder_path}")
+                    ckpt = torch.load(
+                        decoder_path,
+                        weights_only=False,
+                    )
+                    self.decoder = (
+                        ckpt["decoder"]
+                        if isinstance(ckpt, dict)
+                        else ckpt
+                    )
                 else:
-                    decoder_kwargs = {
-                        "emb_dim": self.encoder.emb_dim,
-                    }
+                    decoder_kwargs = {"emb_dim": self.encoder.emb_dim}
+
                     if (
                         hasattr(self.cfg.encoder, "projector_config")
                         and self.cfg.encoder.projector_config is not None
                         and "conv_layers" in self.cfg.encoder.projector_config
                     ):
-                        decoder_kwargs["projector_cfg"] = self.cfg.encoder.projector_config
-                        log.info(f"Passing projector_cfg to decoder")
+                        decoder_kwargs["projector_cfg"] = (
+                            self.cfg.encoder.projector_config
+                        )
+
                     decoder_kwargs["_recursive_"] = False
-                    self.decoder = hydra.utils.instantiate(self.cfg.decoder, **decoder_kwargs)
+
+                    self.decoder = hydra.utils.instantiate(
+                        self.cfg.decoder,
+                        **decoder_kwargs,
+                    )
+
             if not self.train_decoder:
-                for param in self.decoder.parameters():
-                    param.requires_grad = False
-        # NOTE: submodules are intentionally NOT passed to accelerator.prepare() one by
-        # one. Doing so wraps each trainable module in its own DDP, which (a) hides
-        # attributes like `encoder.emb_dim` from VWorldModel and (b) breaks when a
-        # module is called twice per step (EQM double backward). Instead the whole
-        # VWorldModel is wrapped once below.
+                for p in self.decoder.parameters():
+                    p.requires_grad = False
+
         self.model = hydra.utils.instantiate(
             self.cfg.model,
             encoder=self.encoder,
@@ -426,18 +392,18 @@ class Trainer:
             vcreg=self.cfg.training.get("vcreg", False),
             vcreg_std_coeff=self.cfg.training.get("vcreg_std_coeff", 0),
             vcreg_cov_coeff=self.cfg.training.get("vcreg_cov_coeff", 0),
-            vcreg_apply_to=self.cfg.training.get("vcreg_apply_to", "enc"),
-            landscape_shaping=self.cfg.training.get("landscape_shaping", False),  # Or cfg.model.get(...)
+            vcreg_apply_to=self.cfg.training.get(
+                "vcreg_apply_to", "enc"
+            ),
+            landscape_shaping=self.cfg.training.get(
+                "landscape_shaping", False
+            ),
             eqm_lambda=self.cfg.training.get("eqm_lambda", 1.0),
             eqm_weight=self.cfg.training.get("eqm_weight", 0.5),
         )
+
         self._log_trainable_params(self.model, "model")
 
-        # Single DDP wrapper around the whole model (one forward + one backward per
-        # step). prepare() also moves the model to the right device in place, so
-        # self.model (raw) shares parameters with self.ddp_model. Use self.ddp_model
-        # only for the training forward pass; use self.model for everything else
-        # (attributes, rollout, eval). On a single process, ddp_model is model.
         self.ddp_model = self.accelerator.prepare(self.model)
 
     def init_optimizers(self):
@@ -445,13 +411,15 @@ class Trainer:
             self.encoder.parameters(),
             lr=self.cfg.training.encoder_lr,
         )
-        self.encoder_optimizer = self.accelerator.prepare(self.encoder_optimizer)
-        if getattr(self, "_loaded_optim_state", None) and "encoder_optimizer" in self._loaded_optim_state:
-            try:
-                self.encoder_optimizer.load_state_dict(self._loaded_optim_state["encoder_optimizer"])
-                log.info(f"Loaded encoder optimizer state from checkpoint.")
-            except Exception as e:
-                log.warning(f"Failed to load encoder optimizer state: {e}")
+        self.encoder_optimizer = self.accelerator.prepare(
+            self.encoder_optimizer
+        )
+
+        if getattr(self, "_loaded_optim_state", None):
+            state = self._loaded_optim_state.get("encoder_optimizer")
+            if state is not None:
+                self.encoder_optimizer.load_state_dict(state)
+
         if self.cfg.has_predictor:
             self.predictor_optimizer = torch.optim.AdamW(
                 self.predictor.parameters(),
@@ -460,170 +428,215 @@ class Trainer:
             self.predictor_optimizer = self.accelerator.prepare(
                 self.predictor_optimizer
             )
-            if getattr(self, "_loaded_optim_state", None) and "predictor_optimizer" in self._loaded_optim_state:
-                try:
-                    self.predictor_optimizer.load_state_dict(self._loaded_optim_state["predictor_optimizer"])
-                    log.info(f"Loaded predictor optimizer state from checkpoint.")
-                except Exception as e:
-                    log.warning(f"Failed to load predictor optimizer state: {e}")
+
+            if getattr(self, "_loaded_optim_state", None):
+                state = self._loaded_optim_state.get("predictor_optimizer")
+                if state is not None:
+                    self.predictor_optimizer.load_state_dict(state)
 
             self.action_encoder_optimizer = torch.optim.AdamW(
                 itertools.chain(
-                    self.action_encoder.parameters(), self.proprio_encoder.parameters()
+                    self.action_encoder.parameters(),
+                    self.proprio_encoder.parameters(),
                 ),
                 lr=self.cfg.training.action_encoder_lr,
             )
             self.action_encoder_optimizer = self.accelerator.prepare(
                 self.action_encoder_optimizer
             )
-            if getattr(self, "_loaded_optim_state", None) and "action_encoder_optimizer" in self._loaded_optim_state:
-                try:
-                    self.action_encoder_optimizer.load_state_dict(self._loaded_optim_state["action_encoder_optimizer"])
-                    log.info(f"Loaded action/proprio optimizer state from checkpoint.")
-                except Exception as e:
-                    log.warning(f"Failed to load action/proprio optimizer state: {e}")
+
+            if getattr(self, "_loaded_optim_state", None):
+                state = self._loaded_optim_state.get(
+                    "action_encoder_optimizer"
+                )
+                if state is not None:
+                    self.action_encoder_optimizer.load_state_dict(state)
 
         if self.cfg.has_decoder:
             self.decoder_optimizer = torch.optim.Adam(
-                self.decoder.parameters(), lr=self.cfg.training.decoder_lr
+                self.decoder.parameters(),
+                lr=self.cfg.training.decoder_lr,
             )
-            self.decoder_optimizer = self.accelerator.prepare(self.decoder_optimizer)
-            if getattr(self, "_loaded_optim_state", None) and "decoder_optimizer" in self._loaded_optim_state:
-                try:
-                    self.decoder_optimizer.load_state_dict(self._loaded_optim_state["decoder_optimizer"])
-                    log.info(f"Loaded decoder optimizer state from checkpoint.")
-                except Exception as e:
-                    log.warning(f"Failed to load decoder optimizer state: {e}")
+            self.decoder_optimizer = self.accelerator.prepare(
+                self.decoder_optimizer
+            )
 
-    def monitor_jobs(self, lock):
-        """
-        check planning eval jobs' status and update logs
-        """
-        while True:
-            with lock:
-                finished_jobs = [
-                    job_tuple for job_tuple in self.job_set if job_tuple[2].done()
-                ]
-                for epoch, job_name, job in finished_jobs:
-                    result = job.result()
-                    print(f"Logging result for {job_name} at epoch {epoch}: {result}")
-                    log_data = {
-                        f"{job_name}/{key}": value for key, value in result.items()
-                    }
-                    log_data["epoch"] = epoch
-                    self.wandb_run.log(log_data)
-                    self.job_set.remove((epoch, job_name, job))
-            time.sleep(1)
+            if getattr(self, "_loaded_optim_state", None):
+                state = self._loaded_optim_state.get("decoder_optimizer")
+                if state is not None:
+                    self.decoder_optimizer.load_state_dict(state)
 
-    def run(self):
+    # ------------------------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------------------------
+
+    def save_ckpt(self, mid_epoch=False):
+        self.accelerator.wait_for_everyone()
+        ckpt_path = None
+
         if self.accelerator.is_main_process:
-            executor = ThreadPoolExecutor(max_workers=4)
-            self.job_set = set()
-            lock = threading.Lock()
+            os.makedirs("checkpoints", exist_ok=True)
 
-            self.monitor_thread = threading.Thread(
-                target=self.monitor_jobs, args=(lock,), daemon=True
-            )
-            self.monitor_thread.start()
+            ckpt = {}
 
-        init_epoch = self.epoch + 1  # epoch starts from 1
-        for epoch in range(init_epoch, init_epoch + self.total_epochs):
-            self.epoch = epoch
-            if self.accelerator.is_main_process:
-                decoder_active = self.decoder_training_active()
+            for key in self._keys_to_save:
+                value = self.__dict__.get(key)
+
+                if key.endswith("_optimizer") and value is not None:
+                    ckpt[key] = value.state_dict()
+                elif hasattr(value, "module"):
+                    ckpt[key] = self.accelerator.unwrap_model(value)
+                else:
+                    ckpt[key] = value
+
+            if mid_epoch:
+                ckpt["epoch"] = self.epoch - 1
+
+            tmp_path = "checkpoints/model_latest.pth.tmp"
+            torch.save(ckpt, tmp_path)
+            os.replace(tmp_path, "checkpoints/model_latest.pth")
+
+            if mid_epoch:
                 log.info(
-                    "Epoch %s decoder_active=%s (train_decoder=%s, decoder_start_epoch=%s)",
-                    self.epoch,
-                    decoder_active,
-                    self.train_decoder,
-                    self.decoder_start_epoch,
+                    f"Saved mid-epoch checkpoint at global_step="
+                    f"{self.global_step}"
                 )
-            self.accelerator.wait_for_everyone()
-            self.train()
-            self.accelerator.wait_for_everyone()
-            self.val()
-            self.logs_flash(step=self.epoch)
-            if self.epoch % self.cfg.training.save_every_x_epoch == 0:
-                ckpt_path, model_name, model_epoch = self.save_ckpt()
-                # main thread only: launch planning jobs on the saved ckpt
-                if (
-                    self.cfg.plan_settings.plan_cfg_path is not None
-                    and ckpt_path is not None
-                ):  # ckpt_path is only not None for main process
-                    from plan import build_plan_cfg_dicts, launch_plan_jobs
+            else:
+                path = f"checkpoints/model_{self.epoch}.pth"
+                torch.save(ckpt, path)
+                ckpt_path = os.path.join(os.getcwd(), path)
+                log.info(f"Saved {path}")
 
-                    cfg_dicts = build_plan_cfg_dicts(
-                        plan_cfg_path=os.path.join(
-                            self.base_path, self.cfg.plan_settings.plan_cfg_path
-                        ),
-                        ckpt_base_path=self.cfg.ckpt_base_path,
-                        model_name=model_name,
-                        model_epoch=model_epoch,
-                        planner=self.cfg.plan_settings.planner,
-                        goal_source=self.cfg.plan_settings.goal_source,
-                        goal_H=self.cfg.plan_settings.goal_H,
-                        alpha=self.cfg.plan_settings.alpha,
-                    )
-                    jobs = launch_plan_jobs(
-                        epoch=self.epoch,
-                        cfg_dicts=cfg_dicts,
-                        plan_output_dir=os.path.join(
-                            os.getcwd(), "submitit-evals", f"epoch_{self.epoch}"
-                        ),
-                    )
-                    with lock:
-                        self.job_set.update(jobs)
+        return (
+            ckpt_path,
+            self.cfg["saved_folder"].split("/")[-1],
+            self.epoch,
+        )
 
-    def err_eval_single(self, z_pred, z_tgt):
-        logs = {}
-        for k in z_pred.keys():
-            loss = self.model.emb_criterion(z_pred[k], z_tgt[k])
-            logs[k] = loss
-        return logs
+    def load_ckpt(self, filename="model_latest.pth"):
+        ckpt = torch.load(
+            filename,
+            map_location="cpu",
+            weights_only=False,
+        )
 
-    def err_eval(self, z_out, z_tgt, state_tgt=None):
+        self._loaded_optim_state = {}
+
+        for key, value in ckpt.items():
+            if key.endswith("_optimizer") and isinstance(value, dict):
+                self._loaded_optim_state[key] = value
+            else:
+                setattr(self, key, value)
+
+        missing = set(self._keys_to_save) - set(ckpt.keys())
+
+        if missing:
+            log.warning(f"Keys missing from checkpoint: {missing}")
+
+    # ------------------------------------------------------------------
+    # W&B logging
+    # ------------------------------------------------------------------
+
+    def log_train_step(self, loss, loss_components):
         """
-        z_pred: (b, n_hist, n_patches, emb_dim), doesn't include action dims
-        z_tgt: (b, n_hist, n_patches, emb_dim), doesn't include action dims
-        state:  (b, n_hist, dim)
+        Send one W&B record for every training optimizer step.
         """
-        logs = {}
-        slices = {
-            "full": (None, None),
-            "pred": (-self.model.num_pred, None),
-            "next1": (-self.model.num_pred, -self.model.num_pred + 1),
+        self.global_step += 1
+
+        if not self.accelerator.is_main_process:
+            return
+
+        data = {
+            "train/loss": float(loss.item()),
+            "epoch": self.epoch,
         }
-        for name, (start_idx, end_idx) in slices.items():
-            z_out_slice = slice_trajdict_with_t(
-                z_out, start_idx=start_idx, end_idx=end_idx
-            )
-            z_tgt_slice = slice_trajdict_with_t(
-                z_tgt, start_idx=start_idx, end_idx=end_idx
-            )
-            z_err = self.err_eval_single(z_out_slice, z_tgt_slice)
 
-            logs.update({f"z_{k}_err_{name}": v for k, v in z_err.items()})
+        data.update(
+            {
+                f"train/{key}": float(value)
+                for key, value in loss_components.items()
+            }
+        )
 
-        return logs
+        self.wandb_run.log(
+            data,
+            step=self.global_step,
+        )
+
+    def logs_update(self, logs):
+        for key, value in logs.items():
+            if isinstance(value, torch.Tensor):
+                value = [value.detach().cpu().item()]
+
+            length = len(value)
+            count, total = self.epoch_log.get(key, (0, 0.0))
+
+            self.epoch_log[key] = (
+                count + length,
+                total + sum(value),
+            )
+
+    def logs_flash(self):
+        epoch_log = OrderedDict()
+
+        for key, (count, total) in self.epoch_log.items():
+            epoch_log[key] = total / count
+
+        epoch_log["epoch"] = self.epoch
+
+        if "train_loss" in epoch_log:
+            log.info(
+                f"Epoch {self.epoch} "
+                f"Training loss: {epoch_log['train_loss']:.4f} "
+                f"Validation loss: "
+                f"{epoch_log.get('val_loss', float('nan')):.4f}"
+            )
+
+        if self.accelerator.is_main_process:
+            self.wandb_run.log(
+                {
+                    f"epoch/{key}": value
+                    for key, value in epoch_log.items()
+                },
+                step=self.global_step,
+            )
+
+        self.epoch_log = OrderedDict()
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
 
     def train(self):
         for i, data in enumerate(
-            tqdm(self.dataloaders["train"], desc=f"Epoch {self.epoch} Train")
+            tqdm(
+                self.dataloaders["train"],
+                desc=f"Epoch {self.epoch} Train",
+            )
         ):
             obs, act, state = data
-            plot = i == 0  # only plot from the first batch
+            plot = i == 0
+
             decoder_active = self.decoder_training_active()
             self.model.train_decoder = decoder_active
             self.model.train()
+
             if self.cfg.has_decoder:
                 self.decoder.train(decoder_active)
-            z_out, visual_out, visual_reconstructed, loss, loss_components = self.ddp_model(
-                obs, act
-            )
+
+            (
+                z_out,
+                visual_out,
+                visual_reconstructed,
+                loss,
+                loss_components,
+            ) = self.ddp_model(obs, act)
 
             self.encoder_optimizer.zero_grad()
+
             if decoder_active:
                 self.decoder_optimizer.zero_grad()
+
             if self.cfg.has_predictor:
                 self.predictor_optimizer.zero_grad()
                 self.action_encoder_optimizer.zero_grad()
@@ -632,312 +645,409 @@ class Trainer:
 
             if self.model.train_encoder:
                 self.encoder_optimizer.step()
+
             if decoder_active:
                 self.decoder_optimizer.step()
+
             if self.cfg.has_predictor and self.model.train_predictor:
                 self.predictor_optimizer.step()
                 self.action_encoder_optimizer.step()
 
             loss = self.accelerator.gather_for_metrics(loss).mean()
 
-            loss_components = self.accelerator.gather_for_metrics(loss_components)
+            loss_components = self.accelerator.gather_for_metrics(
+                loss_components
+            )
             loss_components = {
-                key: value.mean().item() for key, value in loss_components.items()
+                key: value.mean().item()
+                for key, value in loss_components.items()
             }
+
+            # Accumulate epoch statistics.
+            self.logs_update(
+                {
+                    f"train_{key}": [value]
+                    for key, value in loss_components.items()
+                }
+            )
+            self.logs_update({"train_loss": [loss.item()]})
+
+            # ----------------------------------------------------------
+            # W&B: EVERY TRAINING STEP
+            # ----------------------------------------------------------
+            self.log_train_step(loss, loss_components)
+
+            # Expensive image diagnostics only on first batch.
             if decoder_active and plot:
-                # only eval images when plotting due to speed
                 if self.cfg.has_predictor:
                     z_obs_out, z_act_out = self.model.separate_emb(z_out)
                     z_gt = self.model.encode_obs(obs)
-                    z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
+                    z_tgt = slice_trajdict_with_t(
+                        z_gt,
+                        start_idx=self.model.num_pred,
+                    )
 
-                    state_tgt = state[:, -self.model.num_hist :]  # (b, num_hist, dim)
                     err_logs = self.err_eval(z_obs_out, z_tgt)
-
-                    err_logs = self.accelerator.gather_for_metrics(err_logs)
+                    err_logs = self.accelerator.gather_for_metrics(
+                        err_logs
+                    )
                     err_logs = {
-                        key: value.mean().item() for key, value in err_logs.items()
+                        key: value.mean().item()
+                        for key, value in err_logs.items()
                     }
-                    err_logs = {f"train_{k}": [v] for k, v in err_logs.items()}
 
-                    self.logs_update(err_logs)
+                    self.logs_update(
+                        {
+                            f"train_{key}": [value]
+                            for key, value in err_logs.items()
+                        }
+                    )
 
                 if visual_out is not None:
                     for t in range(
-                        self.cfg.num_hist, self.cfg.num_hist + self.cfg.num_pred
+                        self.cfg.num_hist,
+                        self.cfg.num_hist + self.cfg.num_pred,
                     ):
-                        img_pred_scores = eval_images(
-                            visual_out[:, t - self.cfg.num_pred], obs["visual"][:, t]
+                        scores = eval_images(
+                            visual_out[:, t - self.cfg.num_pred],
+                            obs["visual"][:, t],
                         )
-                        img_pred_scores = self.accelerator.gather_for_metrics(
-                            img_pred_scores
-                        )
-                        img_pred_scores = {
-                            f"train_img_{k}_pred": [v.mean().item()]
-                            for k, v in img_pred_scores.items()
+                        scores = self.accelerator.gather_for_metrics(scores)
+                        scores = {
+                            f"train_img_{key}_pred": [
+                                value.mean().item()
+                            ]
+                            for key, value in scores.items()
                         }
-                        self.logs_update(img_pred_scores)
+                        self.logs_update(scores)
 
                 if visual_reconstructed is not None:
                     for t in range(obs["visual"].shape[1]):
-                        img_reconstruction_scores = eval_images(
-                            visual_reconstructed[:, t], obs["visual"][:, t]
+                        scores = eval_images(
+                            visual_reconstructed[:, t],
+                            obs["visual"][:, t],
                         )
-                        img_reconstruction_scores = self.accelerator.gather_for_metrics(
-                            img_reconstruction_scores
-                        )
-                        img_reconstruction_scores = {
-                            f"train_img_{k}_reconstructed": [v.mean().item()]
-                            for k, v in img_reconstruction_scores.items()
+                        scores = self.accelerator.gather_for_metrics(scores)
+                        scores = {
+                            f"train_img_{key}_reconstructed": [
+                                value.mean().item()
+                            ]
+                            for key, value in scores.items()
                         }
-                        self.logs_update(img_reconstruction_scores)
+                        self.logs_update(scores)
 
                 self.plot_samples(
                     obs["visual"],
                     visual_out,
                     visual_reconstructed,
                     self.epoch,
-                    batch=i,
-                    num_samples=self.num_reconstruct_samples,
-                    phase="train",
+                    i,
+                    self.num_reconstruct_samples,
+                    "train",
                 )
 
-            loss_components = {f"train_{k}": [v] for k, v in loss_components.items()}
-            self.logs_update(loss_components)
-
-            # Rolling mid-epoch checkpoint every `save_every_iters` iterations.
-            # `i > 0` avoids saving a useless one-step checkpoint at iteration 0.
+            # Checkpoint every 500 training steps, but DON'T wait for this
+            # checkpoint interval to send W&B logs.
             if (
                 self.save_every_iters > 0
                 and i > 0
                 and i % self.save_every_iters == 0
             ):
-                self.logs_flash_iter(iteration=i)
                 self.save_ckpt(mid_epoch=True)
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def val(self):
         decoder_active = self.decoder_training_active()
         self.model.train_decoder = decoder_active
         self.model.eval()
+
         if len(self.train_traj_dset) > 0 and self.cfg.has_predictor:
             train_rollout_logs = self.openloop_rollout(
-                self.train_traj_dset, mode="train"
+                self.train_traj_dset,
+                mode="train",
             )
-            train_rollout_logs = {
-                f"train_{k}": [v] for k, v in train_rollout_logs.items()
-            }
-            self.logs_update(train_rollout_logs)
-            val_rollout_logs = self.openloop_rollout(self.val_traj_dset, mode="val")
-            val_rollout_logs = {
-                f"val_{k}": [v] for k, v in val_rollout_logs.items()
-            }
-            self.logs_update(val_rollout_logs)
+
+            self.logs_update(
+                {
+                    f"train_{key}": [value]
+                    for key, value in train_rollout_logs.items()
+                }
+            )
+
+            val_rollout_logs = self.openloop_rollout(
+                self.val_traj_dset,
+                mode="val",
+            )
+
+            self.logs_update(
+                {
+                    f"val_{key}": [value]
+                    for key, value in val_rollout_logs.items()
+                }
+            )
 
         self.accelerator.wait_for_everyone()
+
         for i, data in enumerate(
-            tqdm(self.dataloaders["valid"], desc=f"Epoch {self.epoch} Valid")
+            tqdm(
+                self.dataloaders["valid"],
+                desc=f"Epoch {self.epoch} Valid",
+            )
         ):
             obs, act, state = data
             plot = i == 0
+
             self.model.eval()
-            z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
-                obs, act
-            )
+
+            (
+                z_out,
+                visual_out,
+                visual_reconstructed,
+                loss,
+                loss_components,
+            ) = self.model(obs, act)
 
             loss = self.accelerator.gather_for_metrics(loss).mean()
 
-            loss_components = self.accelerator.gather_for_metrics(loss_components)
+            loss_components = self.accelerator.gather_for_metrics(
+                loss_components
+            )
             loss_components = {
-                key: value.mean().item() for key, value in loss_components.items()
+                key: value.mean().item()
+                for key, value in loss_components.items()
             }
 
+            self.logs_update({"val_loss": [loss.item()]})
+            self.logs_update(
+                {
+                    f"val_{key}": [value]
+                    for key, value in loss_components.items()
+                }
+            )
+
             if decoder_active and plot:
-                # only eval images when plotting due to speed
                 if self.cfg.has_predictor:
                     z_obs_out, z_act_out = self.model.separate_emb(z_out)
                     z_gt = self.model.encode_obs(obs)
-                    z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
+                    z_tgt = slice_trajdict_with_t(
+                        z_gt,
+                        start_idx=self.model.num_pred,
+                    )
 
-                    state_tgt = state[:, -self.model.num_hist :]  # (b, num_hist, dim)
                     err_logs = self.err_eval(z_obs_out, z_tgt)
-
-                    err_logs = self.accelerator.gather_for_metrics(err_logs)
+                    err_logs = self.accelerator.gather_for_metrics(
+                        err_logs
+                    )
                     err_logs = {
-                        key: value.mean().item() for key, value in err_logs.items()
+                        key: value.mean().item()
+                        for key, value in err_logs.items()
                     }
-                    err_logs = {f"val_{k}": [v] for k, v in err_logs.items()}
 
-                    self.logs_update(err_logs)
+                    self.logs_update(
+                        {
+                            f"val_{key}": [value]
+                            for key, value in err_logs.items()
+                        }
+                    )
 
                 if visual_out is not None:
                     for t in range(
-                        self.cfg.num_hist, self.cfg.num_hist + self.cfg.num_pred
+                        self.cfg.num_hist,
+                        self.cfg.num_hist + self.cfg.num_pred,
                     ):
-                        img_pred_scores = eval_images(
-                            visual_out[:, t - self.cfg.num_pred], obs["visual"][:, t]
+                        scores = eval_images(
+                            visual_out[:, t - self.cfg.num_pred],
+                            obs["visual"][:, t],
                         )
-                        img_pred_scores = self.accelerator.gather_for_metrics(
-                            img_pred_scores
+                        scores = self.accelerator.gather_for_metrics(scores)
+                        self.logs_update(
+                            {
+                                f"val_img_{key}_pred": [
+                                    value.mean().item()
+                                ]
+                                for key, value in scores.items()
+                            }
                         )
-                        img_pred_scores = {
-                            f"val_img_{k}_pred": [v.mean().item()]
-                            for k, v in img_pred_scores.items()
-                        }
-                        self.logs_update(img_pred_scores)
 
                 if visual_reconstructed is not None:
                     for t in range(obs["visual"].shape[1]):
-                        img_reconstruction_scores = eval_images(
-                            visual_reconstructed[:, t], obs["visual"][:, t]
+                        scores = eval_images(
+                            visual_reconstructed[:, t],
+                            obs["visual"][:, t],
                         )
-                        img_reconstruction_scores = self.accelerator.gather_for_metrics(
-                            img_reconstruction_scores
+                        scores = self.accelerator.gather_for_metrics(scores)
+                        self.logs_update(
+                            {
+                                f"val_img_{key}_reconstructed": [
+                                    value.mean().item()
+                                ]
+                                for key, value in scores.items()
+                            }
                         )
-                        img_reconstruction_scores = {
-                            f"val_img_{k}_reconstructed": [v.mean().item()]
-                            for k, v in img_reconstruction_scores.items()
-                        }
-                        self.logs_update(img_reconstruction_scores)
 
                 self.plot_samples(
                     obs["visual"],
                     visual_out,
                     visual_reconstructed,
                     self.epoch,
-                    batch=i,
-                    num_samples=self.num_reconstruct_samples,
-                    phase="valid",
+                    i,
+                    self.num_reconstruct_samples,
+                    "valid",
                 )
-            loss_components = {f"val_{k}": [v] for k, v in loss_components.items()}
-            self.logs_update(loss_components)
+
+    # ------------------------------------------------------------------
+    # Rollouts
+    # ------------------------------------------------------------------
 
     def openloop_rollout(
-        self, dset, num_rollout=10, rand_start_end=True, min_horizon=2, mode="train"
+        self,
+        dset,
+        num_rollout=10,
+        rand_start_end=True,
+        min_horizon=2,
+        mode="train",
     ):
         np.random.seed(self.cfg.training.seed)
-        min_horizon = min_horizon + self.cfg.num_hist
+
+        min_horizon += self.cfg.num_hist
         plotting_dir = f"rollout_plots/e{self.epoch}_rollout"
+
         if self.accelerator.is_main_process:
             os.makedirs(plotting_dir, exist_ok=True)
+
         self.accelerator.wait_for_everyone()
         logs = {}
 
-        # rollout with both num_hist and 1 frame as context
-        num_past = [(self.cfg.num_hist, ""), (1, "_1framestart")]
+        num_past = [
+            (self.cfg.num_hist, ""),
+            (1, "_1framestart"),
+        ]
 
-        # sample traj
         for idx in range(num_rollout):
             valid_traj = False
+
             while not valid_traj:
                 traj_idx = np.random.randint(0, len(dset))
                 obs, act, state, _ = dset[traj_idx]
                 act = act.to(self.device)
+
                 if rand_start_end:
-                    if obs["visual"].shape[0] > min_horizon * self.cfg.frameskip + 1:
+                    if (
+                        obs["visual"].shape[0]
+                        > min_horizon * self.cfg.frameskip + 1
+                    ):
                         start = np.random.randint(
                             0,
-                            obs["visual"].shape[0] - min_horizon * self.cfg.frameskip - 1,
+                            obs["visual"].shape[0]
+                            - min_horizon * self.cfg.frameskip
+                            - 1,
                         )
                     else:
                         start = 0
-                    max_horizon = (obs["visual"].shape[0] - start - 1) // self.cfg.frameskip
+
+                    max_horizon = (
+                        obs["visual"].shape[0] - start - 1
+                    ) // self.cfg.frameskip
+
                     if max_horizon > min_horizon:
                         valid_traj = True
-                        horizon = np.random.randint(min_horizon, max_horizon + 1)
+                        horizon = np.random.randint(
+                            min_horizon,
+                            max_horizon + 1,
+                        )
                 else:
                     valid_traj = True
                     start = 0
-                    horizon = (obs["visual"].shape[0] - 1) // self.cfg.frameskip
+                    horizon = (
+                        obs["visual"].shape[0] - 1
+                    ) // self.cfg.frameskip
 
-            for k in obs.keys():
-                obs[k] = obs[k][
-                    start :
-                    start + horizon * self.cfg.frameskip + 1 :
+            for key in obs:
+                obs[key] = obs[key][
+                    start:
+                    start
+                    + horizon * self.cfg.frameskip
+                    + 1:
                     self.cfg.frameskip
                 ]
-            act = act[start : start + horizon * self.cfg.frameskip]
-            act = rearrange(act, "(h f) d -> h (f d)", f=self.cfg.frameskip)
 
-            obs_g = {}
-            for k in obs.keys():
-                obs_g[k] = obs[k][-1].unsqueeze(0).unsqueeze(0).to(self.device)
+            act = act[
+                start:
+                start + horizon * self.cfg.frameskip
+            ]
+
+            act = rearrange(
+                act,
+                "(h f) d -> h (f d)",
+                f=self.cfg.frameskip,
+            )
+
+            obs_g = {
+                key: obs[key][-1]
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .to(self.device)
+                for key in obs
+            }
+
             z_g = self.model.encode_obs(obs_g)
             actions = act.unsqueeze(0)
 
-            for past in num_past:
-                n_past, postfix = past
+            for n_past, postfix in num_past:
+                obs_0 = {
+                    key: obs[key][:n_past]
+                    .unsqueeze(0)
+                    .to(self.device)
+                    for key in obs
+                }
 
-                obs_0 = {}
-                for k in obs.keys():
-                    obs_0[k] = (
-                        obs[k][:n_past].unsqueeze(0).to(self.device)
-                    )  # unsqueeze for batch, (b, t, c, h, w)
+                z_obses, z = self.model.rollout(
+                    obs_0,
+                    actions,
+                )
 
-                z_obses, z = self.model.rollout(obs_0, actions)
-                z_obs_last = slice_trajdict_with_t(z_obses, start_idx=-1, end_idx=None)
-                div_loss = self.err_eval_single(z_obs_last, z_g)
+                z_obs_last = slice_trajdict_with_t(
+                    z_obses,
+                    start_idx=-1,
+                    end_idx=None,
+                )
 
-                for k in div_loss.keys():
-                    log_key = f"z_{k}_err_rollout{postfix}"
-                    if log_key in logs:
-                        logs[f"z_{k}_err_rollout{postfix}"].append(
-                            div_loss[k]
-                        )
-                    else:
-                        logs[f"z_{k}_err_rollout{postfix}"] = [
-                            div_loss[k]
-                        ]
+                div_loss = self.err_eval_single(
+                    z_obs_last,
+                    z_g,
+                )
+
+                for key, value in div_loss.items():
+                    log_key = f"z_{key}_err_rollout{postfix}"
+                    logs.setdefault(log_key, []).append(value)
 
                 if self.cfg.has_decoder:
                     visuals = self.model.decode_obs(z_obses)[0]["visual"]
-                    imgs = torch.cat([obs["visual"], visuals[0].cpu()], dim=0)
+                    imgs = torch.cat(
+                        [obs["visual"], visuals[0].cpu()],
+                        dim=0,
+                    )
+
                     self.plot_imgs(
                         imgs,
                         obs["visual"].shape[0],
-                        f"{plotting_dir}/e{self.epoch}_{mode}_{idx}{postfix}.png",
+                        f"{plotting_dir}/"
+                        f"e{self.epoch}_{mode}_{idx}{postfix}.png",
                     )
-        logs = {
-            key: sum(values) / len(values) for key, values in logs.items() if values
+
+        return {
+            key: sum(values) / len(values)
+            for key, values in logs.items()
+            if values
         }
-        return logs
 
-    def logs_update(self, logs):
-        for key, value in logs.items():
-            if isinstance(value, torch.Tensor):
-                value = value.detach().cpu().item()
-            length = len(value)
-            count, total = self.epoch_log.get(key, (0, 0.0))
-            self.epoch_log[key] = (
-                count + length,
-                total + sum(value),
-            )
-
-    def logs_flash(self, step):
-        epoch_log = OrderedDict()
-        for key, value in self.epoch_log.items():
-            count, sum = value
-            to_log = sum / count
-            epoch_log[key] = to_log
-        epoch_log["epoch"] = step
-        log.info(f"Epoch {self.epoch}  Training loss: {epoch_log['train_loss']:.4f}  \
-                Validation loss: {epoch_log['val_loss']:.4f}")
-
-        if self.accelerator.is_main_process:
-            self.wandb_run.log(epoch_log)
-        self.epoch_log = OrderedDict()
-
-    def logs_flash_iter(self, iteration):
-        iter_log = OrderedDict()
-        for key, value in self.epoch_log.items():
-            count, sum = value
-            to_log = sum / count
-            iter_log[key] = to_log
-        iter_log["iter"] = iteration
-        iter_log["epoch"] = self.epoch
-
-        if self.accelerator.is_main_process:
-            self.wandb_run.log(iter_log)
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
 
     def plot_samples(
         self,
@@ -949,52 +1059,70 @@ class Trainer:
         num_samples=2,
         phase="train",
     ):
-        """
-        input:  gt_imgs, reconstructed_gt_imgs: (b, num_hist + num_pred, 3, img_size, img_size)
-                pred_imgs: (b, num_hist, 3, img_size, img_size)
-        output:   imgs: (b, num_frames, 3, img_size, img_size)
-        """
         num_frames = gt_imgs.shape[1]
-        # sample num_samples images
+
         gt_imgs, pred_imgs, reconstructed_gt_imgs = sample_tensors(
             [gt_imgs, pred_imgs, reconstructed_gt_imgs],
             num_samples,
-            indices=list(range(num_samples))[: gt_imgs.shape[0]],
+            indices=list(range(num_samples))[:gt_imgs.shape[0]],
         )
 
         num_samples = min(num_samples, gt_imgs.shape[0])
 
-        # fill in blank images for frameskips
         if pred_imgs is not None:
             pred_imgs = torch.cat(
-                (
+                [
                     torch.full(
-                        (num_samples, self.model.num_pred, *pred_imgs.shape[2:]),
+                        (
+                            num_samples,
+                            self.model.num_pred,
+                            *pred_imgs.shape[2:],
+                        ),
                         -1,
                         device=self.device,
                     ),
                     pred_imgs,
-                ),
+                ],
                 dim=1,
             )
         else:
-            pred_imgs = torch.full(gt_imgs.shape, -1, device=self.device)
+            pred_imgs = torch.full(
+                gt_imgs.shape,
+                -1,
+                device=self.device,
+            )
 
-        pred_imgs = rearrange(pred_imgs, "b t c h w -> (b t) c h w")
-        gt_imgs = rearrange(gt_imgs, "b t c h w -> (b t) c h w")
-        reconstructed_gt_imgs = rearrange(
-            reconstructed_gt_imgs, "b t c h w -> (b t) c h w"
+        pred_imgs = rearrange(
+            pred_imgs,
+            "b t c h w -> (b t) c h w",
         )
-        imgs = torch.cat([gt_imgs, pred_imgs, reconstructed_gt_imgs], dim=0)
+        gt_imgs = rearrange(
+            gt_imgs,
+            "b t c h w -> (b t) c h w",
+        )
+        reconstructed_gt_imgs = rearrange(
+            reconstructed_gt_imgs,
+            "b t c h w -> (b t) c h w",
+        )
+
+        imgs = torch.cat(
+            [
+                gt_imgs,
+                pred_imgs,
+                reconstructed_gt_imgs,
+            ],
+            dim=0,
+        )
 
         if self.accelerator.is_main_process:
             os.makedirs(phase, exist_ok=True)
+
         self.accelerator.wait_for_everyone()
 
         self.plot_imgs(
             imgs,
-            num_columns=num_samples * num_frames,
-            img_name=f"{phase}/{phase}_e{str(epoch).zfill(5)}_b{batch}.png",
+            num_samples * num_frames,
+            f"{phase}/{phase}_e{epoch:05d}_b{batch}.png",
         )
 
     def plot_imgs(self, imgs, num_columns, img_name):
@@ -1006,8 +1134,129 @@ class Trainer:
             value_range=(-1, 1),
         )
 
+    # ------------------------------------------------------------------
+    # Planning jobs
+    # ------------------------------------------------------------------
 
-@hydra.main(config_path="conf", config_name="train")
+    def monitor_jobs(self, lock):
+        while True:
+            with lock:
+                finished_jobs = [
+                    job_tuple
+                    for job_tuple in self.job_set
+                    if job_tuple[2].done()
+                ]
+
+                for epoch, job_name, job in finished_jobs:
+                    result = job.result()
+
+                    log_data = {
+                        f"{job_name}/{key}": value
+                        for key, value in result.items()
+                    }
+                    log_data["epoch"] = epoch
+
+                    self.wandb_run.log(
+                        log_data,
+                        step=self.global_step,
+                    )
+
+                    self.job_set.remove(
+                        (epoch, job_name, job)
+                    )
+
+            time.sleep(1)
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def run(self):
+        if self.accelerator.is_main_process:
+            executor = ThreadPoolExecutor(max_workers=4)
+            self.job_set = set()
+            lock = threading.Lock()
+
+            self.monitor_thread = threading.Thread(
+                target=self.monitor_jobs,
+                args=(lock,),
+                daemon=True,
+            )
+            self.monitor_thread.start()
+
+        init_epoch = self.epoch + 1
+
+        for epoch in range(
+            init_epoch,
+            init_epoch + self.total_epochs,
+        ):
+            self.epoch = epoch
+
+            if self.accelerator.is_main_process:
+                log.info(
+                    f"Epoch {self.epoch}: "
+                    f"decoder_active={self.decoder_training_active()}"
+                )
+
+            self.accelerator.wait_for_everyone()
+
+            self.train()
+
+            self.accelerator.wait_for_everyone()
+
+            self.val()
+
+            # Epoch-level aggregate in addition to per-step logging.
+            self.logs_flash()
+
+            if (
+                self.epoch
+                % self.cfg.training.save_every_x_epoch
+                == 0
+            ):
+                ckpt_path, model_name, model_epoch = self.save_ckpt()
+
+                if (
+                    self.cfg.plan_settings.plan_cfg_path is not None
+                    and ckpt_path is not None
+                ):
+                    from plan import (
+                        build_plan_cfg_dicts,
+                        launch_plan_jobs,
+                    )
+
+                    cfg_dicts = build_plan_cfg_dicts(
+                        plan_cfg_path=os.path.join(
+                            self.base_path,
+                            self.cfg.plan_settings.plan_cfg_path,
+                        ),
+                        ckpt_base_path=self.cfg.ckpt_base_path,
+                        model_name=model_name,
+                        model_epoch=model_epoch,
+                        planner=self.cfg.plan_settings.planner,
+                        goal_source=self.cfg.plan_settings.goal_source,
+                        goal_H=self.cfg.plan_settings.goal_H,
+                        alpha=self.cfg.plan_settings.alpha,
+                    )
+
+                    jobs = launch_plan_jobs(
+                        epoch=self.epoch,
+                        cfg_dicts=cfg_dicts,
+                        plan_output_dir=os.path.join(
+                            os.getcwd(),
+                            "submitit-evals",
+                            f"epoch_{self.epoch}",
+                        ),
+                    )
+
+                    with lock:
+                        self.job_set.update(jobs)
+
+
+@hydra.main(
+    config_path="conf",
+    config_name="train",
+)
 def main(cfg: OmegaConf):
     trainer = Trainer(cfg)
     trainer.run()
