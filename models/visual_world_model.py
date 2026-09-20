@@ -386,7 +386,7 @@ class VWorldModel(nn.Module):
                     ).requires_grad_(True)  # (B, num_hist, action_dim)
                     
                     # Compute prediction with noisy actions, keeping gradients strictly through actions
-                    z_src_noisy = self.replace_actions_from_z(z_src,act_gamma,)
+                    z_src_noisy = self.replace_actions_from_z(z_src.detach(),act_gamma,)
                     z_pred_noisy = self.predict(z_src_noisy)
 
                     # Isolate visual/proprio (non-action) components for target and noisy prediction
