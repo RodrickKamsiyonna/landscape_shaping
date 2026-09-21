@@ -11,37 +11,6 @@ def pair(t):
 
 
 def generate_mask_matrix(npatch, nwindow):
-    """
-    Create a causal temporal attention mask.
-
-    Layout:
-        [frame_0 patches]
-        [frame_1 patches]
-        ...
-        [frame_{nwindow-1} patches]
-
-    A frame may attend to itself and all previous frames,
-    but not future frames.
-
-    Output shape:
-        (1, 1, nwindow * npatch, nwindow * npatch)
-
-    Example with nwindow=3:
-
-        frame 0 -> frame 0
-        frame 1 -> frame 0, frame 1
-        frame 2 -> frame 0, frame 1, frame 2
-    """
-    if npatch <= 0:
-        raise ValueError(
-            f"npatch must be > 0, got {npatch}"
-        )
-
-    if nwindow <= 0:
-        raise ValueError(
-            f"nwindow must be > 0, got {nwindow}"
-        )
-
     zeros = torch.zeros(
         npatch,
         npatch,
@@ -64,14 +33,9 @@ def generate_mask_matrix(npatch, nwindow):
         )
         rows.append(row)
 
-    mask = torch.cat(
-        rows,
-        dim=0,
-    )
+    mask = torch.cat(rows, dim=0)
 
     return mask.unsqueeze(0).unsqueeze(0)
-
-
 class FeedForward(nn.Module):
     def __init__(
         self,
@@ -128,31 +92,18 @@ class Attention(nn.Module):
 
         self.to_out = (
             nn.Sequential(
-                nn.Linear(
-                    inner_dim,
-                    dim,
-                ),
+                nn.Linear(inner_dim, dim),
                 nn.Dropout(dropout),
             )
             if project_out
             else nn.Identity()
         )
 
-        # ----------------------------------------------------------
-        # IMPORTANT:
-        # Register the mask as a buffer.
-        #
-        # This means:
-        #   model.to("cuda:0") -> bias moves to cuda:0
-        #   model.to("cuda:1") -> bias moves to cuda:1
-        #
-        # Accelerate/DDP will therefore place the mask correctly
-        # for each process.
-        # ----------------------------------------------------------
+        # Boolean mask + registered buffer.
         mask = generate_mask_matrix(
             num_patches,
             num_frames,
-        )
+        ).bool()
 
         self.register_buffer(
             "bias",
@@ -160,28 +111,8 @@ class Attention(nn.Module):
             persistent=False,
         )
 
-        self.num_patches = num_patches
-        self.num_frames = num_frames
-
     def forward(self, x):
-        """
-        x shape:
-            (B, T, C)
-
-        where:
-            T <= num_frames * num_patches
-        """
         B, T, C = x.size()
-
-        if T > self.bias.shape[-1]:
-            raise ValueError(
-                "Input sequence is longer than the "
-                "configured attention mask: "
-                f"T={T}, "
-                f"max_T={self.bias.shape[-1]}, "
-                f"num_frames={self.num_frames}, "
-                f"num_patches={self.num_patches}"
-            )
 
         x = self.norm(x)
 
@@ -204,15 +135,7 @@ class Attention(nn.Module):
             k.transpose(-1, -2),
         ) * self.scale
 
-        # ----------------------------------------------------------
-        # Causal temporal attention.
-        #
-        # self.bias is now a registered buffer, so it lives on the
-        # same device as dots after model/device placement.
-        # ----------------------------------------------------------
-        mask = self.bias[
-            :, :, :T, :T
-        ]
+        mask = self.bias[:, :, :T, :T]
 
         dots = dots.masked_fill(
             ~mask,
@@ -222,10 +145,7 @@ class Attention(nn.Module):
         attn = self.attend(dots)
         attn = self.dropout(attn)
 
-        out = torch.matmul(
-            attn,
-            v,
-        )
+        out = torch.matmul(attn, v)
 
         out = rearrange(
             out,
@@ -233,8 +153,6 @@ class Attention(nn.Module):
         )
 
         return self.to_out(out)
-
-
 class Transformer(nn.Module):
     def __init__(
         self,
