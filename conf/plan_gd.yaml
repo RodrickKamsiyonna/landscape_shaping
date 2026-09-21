@@ -38,7 +38,7 @@ planner:
   sub_planner:
     target: planning.gd.GDPlanner
     lr: 0.1
-    sample_type: zero
+    sample_type: randn
     action_noise: 0
     horizon: 25
     var_scale: 1
