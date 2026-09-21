@@ -11,40 +11,20 @@ def pair(t):
 
 
 def generate_mask_matrix(npatch, nwindow):
-    zeros = torch.zeros(
-        npatch,
-        npatch,
-        dtype=torch.bool,
-    )
-
-    ones = torch.ones(
-        npatch,
-        npatch,
-        dtype=torch.bool,
-    )
-
+    zeros = torch.zeros(npatch, npatch, dtype=torch.bool)
+    ones = torch.ones(npatch, npatch, dtype=torch.bool)
     rows = []
-
     for i in range(nwindow):
-        row = torch.cat(
-            [ones] * (i + 1)
-            + [zeros] * (nwindow - i - 1),
+        rows.append(torch.cat(
+            [ones] * (i + 1) + [zeros] * (nwindow - i - 1),
             dim=1,
-        )
-        rows.append(row)
+        ))
+    return torch.cat(rows, dim=0).unsqueeze(0).unsqueeze(0)
 
-    mask = torch.cat(rows, dim=0)
 
-    return mask.unsqueeze(0).unsqueeze(0)
 class FeedForward(nn.Module):
-    def __init__(
-        self,
-        dim,
-        hidden_dim,
-        dropout=0.0,
-    ):
+    def __init__(self, dim, hidden_dim, dropout=0.):
         super().__init__()
-
         self.net = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, hidden_dim),
@@ -59,198 +39,91 @@ class FeedForward(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(
-        self,
-        dim,
-        heads=8,
-        dim_head=64,
-        dropout=0.0,
-        num_patches=1,
-        num_frames=1,
-    ):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.,
+                 num_patches=1, num_frames=1):
         super().__init__()
-
         inner_dim = dim_head * heads
-        project_out = not (
-            heads == 1
-            and dim_head == dim
-        )
+        project_out = not (heads == 1 and dim_head == dim)
 
         self.heads = heads
         self.scale = dim_head ** -0.5
-
         self.norm = nn.LayerNorm(dim)
-
         self.attend = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
-
-        self.to_qkv = nn.Linear(
-            dim,
-            inner_dim * 3,
-            bias=False,
-        )
-
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
         self.to_out = (
-            nn.Sequential(
-                nn.Linear(inner_dim, dim),
-                nn.Dropout(dropout),
-            )
-            if project_out
-            else nn.Identity()
+            nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+            if project_out else nn.Identity()
         )
-
-        # Boolean mask + registered buffer.
-        mask = generate_mask_matrix(
-            num_patches,
-            num_frames,
-        ).bool()
-
         self.register_buffer(
             "bias",
-            mask,
+            generate_mask_matrix(num_patches, num_frames),
             persistent=False,
         )
 
     def forward(self, x):
-        B, T, C = x.size()
-
+        B, T, C = x.shape
         x = self.norm(x)
 
-        qkv = self.to_qkv(x).chunk(
-            3,
-            dim=-1,
-        )
-
+        q, k, v = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = map(
-            lambda t: rearrange(
-                t,
-                "b n (h d) -> b h n d",
-                h=self.heads,
-            ),
-            qkv,
+            lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads),
+            (q, k, v),
         )
 
-        dots = torch.matmul(
-            q,
-            k.transpose(-1, -2),
-        ) * self.scale
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        dots = dots.masked_fill(~self.bias[:, :, :T, :T], float("-inf"))
 
-        mask = self.bias[:, :, :T, :T]
-
-        dots = dots.masked_fill(
-            ~mask,
-            float("-inf"),
-        )
-
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
-
+        attn = self.dropout(self.attend(dots))
         out = torch.matmul(attn, v)
-
-        out = rearrange(
-            out,
-            "b h n d -> b n (h d)",
-        )
+        out = rearrange(out, "b h n d -> b n (h d)")
 
         return self.to_out(out)
+
+
 class Transformer(nn.Module):
-    def __init__(
-        self,
-        dim,
-        depth,
-        heads,
-        dim_head,
-        mlp_dim,
-        dropout=0.0,
-        num_patches=1,
-        num_frames=1,
-    ):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim,
+                 dropout=0., num_patches=1, num_frames=1):
         super().__init__()
-
         self.norm = nn.LayerNorm(dim)
-
-        self.layers = nn.ModuleList([])
-
-        for _ in range(depth):
-            self.layers.append(
-                nn.ModuleList(
-                    [
-                        Attention(
-                            dim=dim,
-                            heads=heads,
-                            dim_head=dim_head,
-                            dropout=dropout,
-                            num_patches=num_patches,
-                            num_frames=num_frames,
-                        ),
-                        FeedForward(
-                            dim,
-                            mlp_dim,
-                            dropout=dropout,
-                        ),
-                    ]
-                )
-            )
+        self.layers = nn.ModuleList([
+            nn.ModuleList([
+                Attention(
+                    dim=dim,
+                    heads=heads,
+                    dim_head=dim_head,
+                    dropout=dropout,
+                    num_patches=num_patches,
+                    num_frames=num_frames,
+                ),
+                FeedForward(dim, mlp_dim, dropout=dropout),
+            ])
+            for _ in range(depth)
+        ])
 
     def forward(self, x):
         for attn, ff in self.layers:
             x = attn(x) + x
             x = ff(x) + x
-
         return self.norm(x)
 
 
 class ViTPredictor(nn.Module):
-    def __init__(
-        self,
-        *,
-        num_patches,
-        num_frames,
-        dim,
-        depth,
-        heads,
-        mlp_dim,
-        pool="cls",
-        dim_head=64,
-        dropout=0.0,
-        emb_dropout=0.0,
-    ):
+    def __init__(self, *, num_patches, num_frames, dim, depth, heads,
+                 mlp_dim, pool='cls', dim_head=64, dropout=0.,
+                 emb_dropout=0.):
         super().__init__()
-
-        assert pool in {
-            "cls",
-            "mean",
-        }, (
-            "pool type must be either "
-            "cls (cls token) or "
-            "mean (mean pooling)"
-        )
+        assert pool in {'cls', 'mean'}, \
+            "pool type must be either cls (cls token) or mean (mean pooling)"
 
         self.num_patches = num_patches
         self.num_frames = num_frames
         self.pool = pool
 
-        # ----------------------------------------------------------
-        # Positional embedding
-        # ----------------------------------------------------------
         self.pos_embedding = nn.Parameter(
-            torch.randn(
-                1,
-                num_frames * num_patches,
-                dim,
-            )
+            torch.randn(1, num_frames * num_patches, dim)
         )
-
-        self.dropout = nn.Dropout(
-            emb_dropout
-        )
-
-        # ----------------------------------------------------------
-        # Transformer
-        #
-        # Pass num_patches and num_frames explicitly instead of using
-        # process-global variables.
-        # ----------------------------------------------------------
+        self.dropout = nn.Dropout(emb_dropout)
         self.transformer = Transformer(
             dim=dim,
             depth=depth,
@@ -263,32 +136,12 @@ class ViTPredictor(nn.Module):
         )
 
     def forward(self, x):
-        """
-        x:
-            (B, num_frames * num_patches, dim)
-
-        Returns:
-            (B, num_frames * num_patches, dim)
-        """
-        b, n, _ = x.shape
-
+        _, n, _ = x.shape
         if n > self.pos_embedding.shape[1]:
             raise ValueError(
-                "Input sequence is longer than the "
-                "configured positional embedding: "
-                f"n={n}, "
-                f"max_n={self.pos_embedding.shape[1]}, "
-                f"num_frames={self.num_frames}, "
-                f"num_patches={self.num_patches}"
+                f"Input sequence length {n} exceeds maximum "
+                f"{self.pos_embedding.shape[1]}"
             )
 
-        x = (
-            x
-            + self.pos_embedding[:, :n]
-        )
-
-        x = self.dropout(x)
-
-        x = self.transformer(x)
-
-        return x
+        x = x + self.pos_embedding[:, :n]
+        return self.transformer(self.dropout(x))
