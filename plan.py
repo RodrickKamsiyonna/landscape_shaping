@@ -362,7 +362,7 @@ def load_ckpt(snapshot_path, device):
     from models.dino import DinoV2Encoder
     _ = DinoV2Encoder('dinov2_vits14', 'x_norm_patchtokens')
     with snapshot_path.open("rb") as f:
-        payload = torch.load(f, map_location=device)
+        payload = torch.load(f, map_location=device, weights_only=False)
     loaded_keys = []
     result = {}
     for k, v in payload.items():
