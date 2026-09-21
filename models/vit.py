@@ -11,6 +11,11 @@ def pair(t):
 
 
 def generate_mask_matrix(npatch, nwindow):
+    """Block-causal mask: frame i can attend to frames 0..i.
+
+    Returns a bool tensor of shape (1, 1, npatch * nwindow, npatch * nwindow),
+    where True means "allowed to attend".
+    """
     zeros = torch.zeros(npatch, npatch, dtype=torch.bool)
     ones = torch.ones(npatch, npatch, dtype=torch.bool)
     rows = []
@@ -72,7 +77,12 @@ class Attention(nn.Module):
         )
 
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        dots = dots.masked_fill(~self.bias[:, :, :T, :T], float("-inf"))
+
+        # Force the mask to bool regardless of what dtype the buffer ended up
+        # with (float32 / bf16 / int after a resume, .to(dtype), etc.).
+        # `~` is only defined for bool/integer tensors.
+        allowed = self.bias[:, :, :T, :T].to(device=dots.device, dtype=torch.bool)
+        dots = dots.masked_fill(~allowed, float("-inf"))
 
         attn = self.dropout(self.attend(dots))
         out = torch.matmul(attn, v)
