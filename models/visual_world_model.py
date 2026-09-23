@@ -376,42 +376,38 @@ class VWorldModel(nn.Module):
             if self.landscape_shaping:
                 act_src = act[:, : self.num_hist, ...]
                 batch_size = act_src.shape[0]
-                
+
                 with torch.enable_grad():
                     gamma = torch.rand(batch_size, 1, 1, device=act_src.device, dtype=act_src.dtype)
                     eps = torch.randn_like(act_src)
-                    
                     act_gamma = (
                         gamma * act_src.detach() + (1 - gamma) * eps
-                    ).requires_grad_(True)  # (B, num_hist, action_dim)
-                    
-                    # Compute prediction with noisy actions, keeping gradients strictly through actions
-                    z_src_noisy = self.replace_actions_from_z(z_src.detach(),act_gamma,)
+                    ).requires_grad_(True)
+
+                    z_src_noisy = self.replace_actions_from_z(z_src.detach(), act_gamma)
                     z_pred_noisy = self.predict(z_src_noisy)
 
-                    # Isolate visual/proprio (non-action) components for target and noisy prediction
                     if self.concat_dim == 0:
                         pred_noisy_vp = z_pred_noisy[:, :, :-1, :]
                         tgt_vp = z_tgt.detach()[:, :, :-1, :]
                     elif self.concat_dim == 1:
                         pred_noisy_vp = z_pred_noisy[..., :-self.action_dim]
                         tgt_vp = z_tgt.detach()[..., :-self.action_dim]
-                        
-                    # Calculate energy as sum of squared distances over all dimensions (creates scalar)
+
                     energy = (pred_noisy_vp - tgt_vp).pow(2).mean()
-                    
-                    # Gradients of energy w.r.t the noisy actions
-                    grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
-                    
-                    # Target gradient
-                    target_grad = (eps - act_src.detach()) * self.eqm_lambda * (1 - gamma)
-                    
-                pred_loss_eqm = (grad_energy - target_grad).pow(2).mean()
+                    grad_energy = torch.autograd.grad(
+                        energy, act_gamma, create_graph=True
+                    )[0]
+                    target_grad = eps - act_src.detach()
+
+                grad_energy = F.normalize(grad_energy.flatten(1), dim=1, eps=1e-8)
+                target_grad = F.normalize(target_grad.flatten(1), dim=1, eps=1e-8)
+                pred_loss_eqm = (1 - (grad_energy * target_grad).sum(dim=1)).mean()
+
                 loss = loss + self.eqm_weight * pred_loss_eqm
-                
                 loss_components["pred_loss_eqm"] = pred_loss_eqm
                 loss_components["energy"] = energy.detach()
-
+                
             if self.vcreg:
                 z_vic_in = self.visual_prop(z)
                 z_std_loss = self.vcreg_std_loss(z_vic_in)
